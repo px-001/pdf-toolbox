@@ -1,0 +1,11 @@
+.venv/
+dist/
+build/
+*.spec
+.workbuddy/
+src/testdata/
+src/testdata_tools/
+stress_*/
+__pycache__/
+*.pyc
+.DS_Store

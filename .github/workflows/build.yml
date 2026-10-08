@@ -1,0 +1,40 @@
+name: Build
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: PDFOCR工具-windows
+          - os: macos-latest
+            name: PDFOCR工具-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyMuPDF numpy Pillow openpyxl rapidocr-onnxruntime pyinstaller
+
+      - name: Build
+        run: python build.py --clean
+
+      - name: Verify (Windows)
+        if: runner.os == 'Windows'
+        run: dist\PDFOCR工具.exe --selftest
+
+      - name: Verify (macOS)
+        if: runner.os == 'macOS'
+        run: ./dist/PDFOCR工具 --selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/

@@ -103,6 +103,7 @@ BIG_PAGE_COUNT = 500           # 页数超过该值提示耗时
 LOG_MAX_LINES = 4000           # 日志区最多保留行数
 LOG_TRIM_CHUNK = 500           # 超出后一次裁剪的行数
 LOG_QUEUE_SOFT_LIMIT = 5000    # 日志队列软上限，超过则丢弃进度消息
+LOG_FILENAME = "pdftool.log"   # 持久化日志文件名（窗口化产物无控制台，靠它排查）
 
 
 LANGUAGES = [
@@ -157,6 +158,137 @@ def human_size(num: float) -> str:
             return f"{num:.0f} {unit}" if unit == "B" else f"{num:.2f} {unit}"
         num /= 1024
     return f"{num:.2f} GB"
+
+
+# --------------------------------------------------------------------------
+# 诊断与持久化日志
+# 窗口化（--windowed）打包产物没有控制台，出错时用户看不到任何信息，
+# 因此把环境信息与运行日志落盘，便于在别人机器上定位问题。
+# --------------------------------------------------------------------------
+_log_lock = threading.Lock()
+_log_fh = None                    # 复用的日志文件句柄（避免每行开关文件）
+LOG_MAX_BYTES = 5 * 1024 * 1024   # 日志超过 5MB 自动截断，防止无限增长
+
+
+def writable_dir() -> Path:
+    """返回第一个可写目录：可执行文件所在目录 → 当前目录 → 临时目录。"""
+    import tempfile
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent)
+    candidates.append(Path.cwd())
+    candidates.append(Path(tempfile.gettempdir()))
+    for cand in candidates:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".pdftool_write_test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return cand
+        except Exception:
+            continue
+    return Path(".")
+
+
+def log_file_path() -> Path:
+    return writable_dir() / LOG_FILENAME
+
+
+def append_file_log(text: str) -> None:
+    """追加一行到日志文件（失败静默，绝不因为写日志而崩溃）。"""
+    global _log_fh
+    try:
+        with _log_lock:
+            if _log_fh is None:
+                path = log_file_path()
+                try:
+                    if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+                        path.write_text("(日志超过上限，已重置)\n", encoding="utf-8")
+                except Exception:
+                    pass
+                _log_fh = open(path, "a", encoding="utf-8", buffering=1)
+            _log_fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}\n")
+    except Exception:
+        try:
+            if _log_fh is not None:
+                _log_fh.close()
+        except Exception:
+            pass
+        _log_fh = None
+
+
+def collect_env_report() -> list[str]:
+    """收集运行环境与关键资源信息，用于排查「换台电脑就失败」类问题。"""
+    lines: list[str] = []
+    lines.append(f"程序版本: {APP_NAME}")
+    lines.append(f"frozen(打包运行): {getattr(sys, 'frozen', False)}")
+    lines.append(f"可执行文件: {sys.executable}")
+    lines.append(f"解压目录(_MEIPASS): {getattr(sys, '_MEIPASS', '(非打包运行)')}")
+    lines.append(f"当前目录: {os.getcwd()}")
+    lines.append(f"系统: {sys.platform} / {platform.machine()} / "
+                 f"{platform.platform()}")
+    lines.append(f"Python: {sys.version.split()[0]}")
+    lines.append(f"日志文件: {log_file_path()}")
+
+    # 关键第三方库
+    for name, mod in (("PyMuPDF", fitz), ("numpy", np), ("Pillow", Image),
+                      ("openpyxl", Workbook)):
+        ver = getattr(mod, "__version__", "")
+        lines.append(f"依赖 {name}: {'正常' if mod is not None else '缺失'} {ver}")
+
+    # OCR 引擎与模型文件（换机失败最常见的原因）
+    try:
+        import rapidocr_onnxruntime  # noqa: F401
+        lines.append("依赖 rapidocr_onnxruntime: 正常")
+    except Exception as exc:
+        lines.append(f"依赖 rapidocr_onnxruntime: 导入失败 -> {type(exc).__name__}: {exc}")
+    try:
+        import onnxruntime
+        lines.append(f"依赖 onnxruntime: 正常 {getattr(onnxruntime, '__version__', '')}")
+    except Exception as exc:
+        # 缺 VC++ 运行库时，这里通常是 DLL load failed
+        lines.append(f"依赖 onnxruntime: 导入失败 -> {type(exc).__name__}: {exc}")
+
+    # OCR 模型文件（换机失败最常见原因）：打包时在 _MEIPASS，源码时在 site-packages
+    search_dirs: list[Path] = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        search_dirs.append(Path(base))
+    try:
+        import rapidocr_onnxruntime as _rocr
+        search_dirs.append(Path(_rocr.__file__).resolve().parent)
+    except Exception:
+        pass
+    found_models: dict[str, Path] = {}
+    for d in search_dirs:
+        try:
+            for pat in ("rapidocr_onnxruntime/models/*.onnx", "models/*.onnx"):
+                for m in d.rglob(pat):
+                    found_models[str(m.resolve())] = m
+        except Exception:
+            continue
+    lines.append(f"OCR 模型文件: 找到 {len(found_models)} 个")
+    for m in sorted(found_models.values(), key=lambda x: x.name):
+        lines.append(f"    {m.name}  {m.stat().st_size / 1024:.0f} KB")
+    if not found_models:
+        lines.append("    ⚠️ 未找到模型文件，OCR 将无法工作")
+
+    # 文本层写中文所需字体
+    cjk = []
+    for cand in ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                 "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+                 "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"):
+        if os.path.exists(cand):
+            cjk.append(cand)
+    lines.append(f"系统中文字体: {cjk if cjk else '未找到（不影响 OCR，仅影响水印/签名中文）'}")
+    return lines
+
+
+def append_env_report() -> None:
+    """把环境报告写入日志文件（每次启动记录一次，便于事后对比）。"""
+    append_file_log("========== 启动 ==========")
+    for ln in collect_env_report():
+        append_file_log(ln)
 
 
 def safe_dpi_for(width_pt: float, height_pt: float, want_dpi: int,
@@ -1768,6 +1900,61 @@ class App(tk.Tk):
         self._reset_advanced()
         self._sync_mode()
         self.after(120, self._poll_queue)
+        # 启动时记录环境并做可运行性预检（打包产物无控制台，靠日志排障）
+        self.after(200, self._startup_diagnostics)
+
+    # -- 启动诊断 --------------------------------------------------------
+    def _startup_diagnostics(self) -> None:
+        append_env_report()
+        self._log("info", f"{APP_NAME} 已启动"
+                          f"｜{'打包运行' if getattr(sys, 'frozen', False) else '源码运行'}"
+                          f"｜{sys.platform}/{platform.machine()}")
+        self._log("info", f"日志文件：{log_file_path()}")
+        problems: list[str] = []
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # noqa: F401
+        except Exception as exc:
+            problems.append(f"OCR 引擎导入失败（{type(exc).__name__}: {exc}）")
+        try:
+            import onnxruntime  # noqa: F401
+        except Exception as exc:
+            problems.append(f"onnxruntime 加载失败（{type(exc).__name__}: {exc}）")
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            try:
+                n = len(list(Path(base).rglob("rapidocr_onnxruntime/models/*.onnx")))
+                if n == 0:
+                    problems.append("未找到 OCR 模型文件")
+            except Exception:
+                pass
+        if fitz is None:
+            problems.append("PyMuPDF 未安装")
+        for p in problems:
+            self._log("error", p)
+        if problems:
+            self._log("error", "检测到环境问题，OCR 可能无法正常工作；"
+                               "请把日志文件发给技术支持")
+            messagebox.showwarning(
+                "环境预检未通过",
+                "检测到以下问题，OCR 可能无法正常工作：\n\n"
+                + "\n".join(f"· {p}" for p in problems)
+                + f"\n\n详细信息见日志：\n{log_file_path()}\n\n"
+                  "可先运行自检：PDFOCR工具.exe --selftest（会生成 selftest_report.txt）"
+            )
+
+    def report_callback_exception(self, exc, val, tb) -> None:
+        """Tk 回调异常兜底：落盘 + 弹窗，避免窗口化产物静默失败。"""
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        append_file_log(f"[未捕获异常] {detail}")
+        try:
+            self._log("error", f"发生未处理异常：{exc}: {val}")
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("程序异常",
+                                 f"{exc}: {val}\n\n详细信息已写入日志：\n{log_file_path()}")
+        except Exception:
+            pass
 
     # -- UI 构建 ---------------------------------------------------------
     def _build_ui(self) -> None:
@@ -2454,6 +2641,10 @@ class App(tk.Tk):
     _ts = datetime.now().strftime("%H:%M:%S")
 
     def _append(self, level: str, text: str) -> None:
+        # 同步落盘：窗口化产物无控制台，日志文件是唯一的事后排查依据
+        prefix0 = {"ok": "[成功] ", "error": "[失败] ",
+                   "warn": "[警告] "}.get(level, "")
+        append_file_log(f"{prefix0}{text}")
         self.txt_log.configure(state="normal")
         prefix = {
             "ok": "[成功] ", "error": "[失败] ", "warn": "[警告] ",
@@ -2515,22 +2706,7 @@ def _selftest_report_path() -> Path:
     Windows 下 --windowed 打包的产物**没有控制台**，sys.stdout 为 None，
     print 是空操作，因此必须把结果写入文件供用户查看。
     """
-    import tempfile
-    candidates: list[Path] = []
-    if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent)
-    candidates.append(Path.cwd())
-    candidates.append(Path(tempfile.gettempdir()))
-    for cand in candidates:
-        try:
-            cand.mkdir(parents=True, exist_ok=True)
-            probe = cand / ".pdftool_write_test"
-            probe.write_text("", encoding="utf-8")
-            probe.unlink()
-            return cand / "selftest_report.txt"
-        except Exception:
-            continue
-    return Path("selftest_report.txt")
+    return writable_dir() / "selftest_report.txt"
 
 
 def run_selftest() -> int:
@@ -2565,10 +2741,8 @@ def run_selftest() -> int:
             ok = False
 
     emit(f"=== {APP_NAME} 自检 ===")
-    emit(f"frozen: {getattr(sys, 'frozen', False)}")
-    emit(f"executable: {sys.executable}")
-    emit(f"工作目录: {os.getcwd()}")
-    emit(f"平台: {sys.platform} / {platform.machine()}")
+    for ln in collect_env_report():
+        emit(ln)
     emit("")
 
     check("PyMuPDF 可用", fitz is not None, getattr(fitz, "__version__", "") if fitz else "")

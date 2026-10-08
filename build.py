@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import shutil
 import subprocess
@@ -54,6 +55,31 @@ COLLECT_ALL = ["rapidocr_onnxruntime", "pyclipper", "shapely", "onnxruntime"]
 EXCLUDES = ["matplotlib", "tkinter.test", "test", "unittest", "pytest",
             "IPython", "notebook", "pandas", "scipy", "PyQt5", "PySide2"]
 
+# onnxruntime 依赖 MSVC 运行库。干净系统若未安装 VC++ Redistributable，
+# 打包产物会在别人机器上加载失败，表现为「自己机器能跑，换台电脑所有文件 OCR 都失败」。
+# 这里把运行库一并打进产物，使其自包含。
+WIN_RUNTIME_DLLS = ["msvcp140.dll", "vcruntime140.dll",
+                    "vcruntime140_1.dll", "concrt140.dll"]
+
+
+def windows_runtime_binaries() -> tuple[list[str], list[str]]:
+    """收集随包分发的 Windows C++ 运行库，返回 (PyInstaller 参数, 命中的文件名)。"""
+    if platform.system() != "Windows":
+        return [], []
+    search_dirs = [Path(sys.base_prefix), Path(sys.base_prefix) / "DLLs"]
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    search_dirs.append(Path(sysroot) / "System32")
+    found: dict[str, Path] = {}
+    for d in search_dirs:
+        for name in WIN_RUNTIME_DLLS:
+            p = d / name
+            if p.exists() and name not in found:
+                found[name] = p
+    args: list[str] = []
+    for name, p in found.items():
+        args += ["--add-binary", f"{p}{os.pathsep}."]
+    return args, sorted(found)
+
 
 def build(mode: str = "onefile", clean: bool = False) -> int:
     if clean:
@@ -70,12 +96,21 @@ def build(mode: str = "onefile", clean: bool = False) -> int:
         cmd += ["--collect-all", pkg]
     for mod in EXCLUDES:
         cmd += ["--exclude-module", mod]
+
+    runtime_args, runtime_names = windows_runtime_binaries()
+    if runtime_args:
+        cmd += runtime_args
+        print(f"随包打入 MSVC 运行库: {', '.join(runtime_names)}")
+    elif platform.system() == "Windows":
+        print("⚠️ 未在系统中找到 MSVC 运行库（msvcp140/vcruntime140），"
+              "目标机器需自行安装 VC++ Redistributable")
+
     cmd.append(str(ENTRY))
 
     print("执行:", " ".join(cmd))
     result = subprocess.run(cmd, cwd=ROOT)
     if result.returncode != 0:
-        print("\n❌ 打包失败")
+        print("\n[失败] 打包未成功")
         return result.returncode
     return report()
 
@@ -83,8 +118,11 @@ def build(mode: str = "onefile", clean: bool = False) -> int:
 def report() -> int:
     dist = ROOT / "dist"
     system = platform.system()
+    machine = platform.machine()
     print("\n" + "=" * 60)
-    print(f"打包完成（{system} / {platform.machine()}）")
+    print(f"打包完成（{system} / {machine}）")
+    if system == "Windows":
+        print(f"目标架构：{machine}（AMD64 = 64 位 Intel/AMD；ARM64 = 骁龙等）")
     print("=" * 60)
     if not dist.exists():
         print("❌ 未找到 dist 目录")

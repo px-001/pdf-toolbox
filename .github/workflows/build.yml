@@ -2,6 +2,11 @@ name: Build
 
 on: [push, workflow_dispatch]
 
+env:
+  # Windows 运行器默认 cp1252，脚本打印中文会 UnicodeEncodeError
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
+
 jobs:
   build:
     strategy:
@@ -14,6 +19,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -28,13 +34,31 @@ jobs:
 
       - name: Verify (Windows)
         if: runner.os == 'Windows'
-        run: dist\PDFOCR工具.exe --selftest
+        shell: pwsh
+        run: |
+          # GUI 子系统程序用 Start-Process -Wait 才能拿到可靠退出码
+          $p = Start-Process -FilePath ".\dist\PDFOCR工具.exe" -ArgumentList "--selftest" -Wait -PassThru
+          # --windowed 产物没有控制台，输出为空，必须读自检报告文件
+          if (Test-Path ".\dist\selftest_report.txt") {
+            Get-Content ".\dist\selftest_report.txt" -Encoding UTF8
+          } else {
+            Write-Error "未生成 selftest_report.txt"
+            exit 1
+          }
+          if ($p.ExitCode -ne 0) {
+            Write-Error "自检失败，退出码 $($p.ExitCode)"
+            exit $p.ExitCode
+          }
 
       - name: Verify (macOS)
         if: runner.os == 'macOS'
-        run: ./dist/PDFOCR工具 --selftest
+        run: |
+          ./dist/PDFOCR工具 --selftest
+          cat ./dist/selftest_report.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/
+          path: |
+            dist/
+            !dist/selftest_report.txt

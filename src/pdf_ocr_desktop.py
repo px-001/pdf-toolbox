@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import os
+import platform
 import queue
 import re
 import sys
@@ -2494,32 +2495,89 @@ class App(tk.Tk):
         self.on_scan()
 
 
+def force_utf8_stdio() -> None:
+    """强制 stdout/stderr 使用 UTF-8。
+
+    Windows 控制台（含 GitHub Actions）默认 cp1252/gbk，直接 print 中文会抛
+    UnicodeEncodeError 中断程序；errors="replace" 保证终端无法显示时也不崩。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def _selftest_report_path() -> Path:
+    """自检报告落盘位置。
+
+    Windows 下 --windowed 打包的产物**没有控制台**，sys.stdout 为 None，
+    print 是空操作，因此必须把结果写入文件供用户查看。
+    """
+    import tempfile
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent)
+    candidates.append(Path.cwd())
+    candidates.append(Path(tempfile.gettempdir()))
+    for cand in candidates:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".pdftool_write_test"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return cand / "selftest_report.txt"
+        except Exception:
+            continue
+    return Path("selftest_report.txt")
+
+
 def run_selftest() -> int:
     """打包产物自检：验证依赖、模型加载、OCR 识别与双层 PDF 生成。
 
     用于确认 PyInstaller 冻结环境中资源（OCR 模型、字体）是否完整，
     可直接对打包产物执行：./PDFOCR工具 --selftest
+    结果同时输出到终端（若有）和 selftest_report.txt。
     """
     import tempfile
-    print(f"=== {APP_NAME} 自检 ===")
-    print(f"frozen: {getattr(sys, 'frozen', False)}")
-    print(f"executable: {sys.executable}")
-    print(f"工作目录: {os.getcwd()}")
+    force_utf8_stdio()
+
+    lines: list[str] = []
+
+    def emit(text: str = "") -> None:
+        """同时写终端与缓冲；无 stdout（Windows 窗口化产物）时静默跳过。"""
+        lines.append(text)
+        try:
+            stream = sys.stdout
+            if stream is not None:
+                stream.write(text + "\n")
+                stream.flush()
+        except Exception:
+            pass
 
     ok = True
 
     def check(name: str, cond: bool, detail: str = "") -> None:
         nonlocal ok
-        print(f"  {'✅' if cond else '❌'} {name}" + (f" — {detail}" if detail else ""))
+        emit(f"  {'[PASS]' if cond else '[FAIL]'} {name}" + (f" — {detail}" if detail else ""))
         if not cond:
             ok = False
+
+    emit(f"=== {APP_NAME} 自检 ===")
+    emit(f"frozen: {getattr(sys, 'frozen', False)}")
+    emit(f"executable: {sys.executable}")
+    emit(f"工作目录: {os.getcwd()}")
+    emit(f"平台: {sys.platform} / {platform.machine()}")
+    emit("")
 
     check("PyMuPDF 可用", fitz is not None, getattr(fitz, "__version__", "") if fitz else "")
     check("numpy 可用", np is not None)
     check("Pillow 可用", Image is not None)
     check("openpyxl 可用", Workbook is not None)
     if fitz is None or Image is None:
-        print("关键依赖缺失，终止自检")
+        emit("关键依赖缺失，终止自检")
+        _save_selftest_report(lines, emit)
         return 1
 
     work = Path(tempfile.mkdtemp(prefix="pdftool_selftest_"))
@@ -2530,6 +2588,7 @@ def run_selftest() -> int:
         for cand in ("/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
                      "/System/Library/Fonts/STHeiti Medium.ttc",
                      "C:/Windows/Fonts/msyh.ttc",
+                     "C:/Windows/Fonts/simhei.ttf",
                      "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"):
             if os.path.exists(cand):
                 font_path = cand
@@ -2543,7 +2602,7 @@ def run_selftest() -> int:
             f = _ID.ImageFont.truetype(font_path, 48) if font_path else _ID.ImageFont.load_default()
             draw.text((80, 120), "自检 SELFTEST 2026", fill="black", font=f)
         except Exception as exc:
-            print(f"  (测试图绘制降级: {exc})")
+            emit(f"  (测试图绘制降级: {exc})")
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=90)
         page.insert_image(fitz.Rect(0, 0, 595, 842), stream=buf.getvalue())
@@ -2591,11 +2650,16 @@ def run_selftest() -> int:
         eff, changed = safe_dpi_for(2384, 3370, 600, 45)
         check("内存防护生效（A0 自动降 DPI）", changed and eff < 600, f"{eff}dpi")
 
-        print("\n" + ("=== 自检全部通过 ✅ ===" if ok else "=== 自检存在失败项 ❌ ==="))
+        emit("")
+        emit("=== 自检全部通过 ===" if ok else "=== 自检存在失败项 ===")
+        _save_selftest_report(lines, emit)
         return 0 if ok else 1
     except Exception as exc:
-        print(f"\n❌ 自检异常: {type(exc).__name__}: {exc}")
-        traceback.print_exc()
+        emit(f"")
+        emit(f"[异常] 自检失败: {type(exc).__name__}: {exc}")
+        for ln in traceback.format_exc().splitlines():
+            emit("    " + ln)
+        _save_selftest_report(lines, emit)
         return 1
     finally:
         try:
@@ -2605,7 +2669,18 @@ def run_selftest() -> int:
             pass
 
 
+def _save_selftest_report(lines: list[str], emit: Callable[[str], None]) -> None:
+    """把自检结果写入文件（Windows 窗口化产物无控制台，必须落盘）。"""
+    try:
+        path = _selftest_report_path()
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        emit(f"报告已写入: {path}")
+    except Exception as exc:
+        emit(f"(报告写入失败: {exc})")
+
+
 def main() -> None:
+    force_utf8_stdio()   # Windows 控制台默认非 UTF-8，避免输出中文时中断
     if "--selftest" in sys.argv or "-t" in sys.argv:
         sys.exit(run_selftest())
     app = App()

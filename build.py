@@ -24,6 +24,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def _force_utf8() -> None:
+    """强制 stdout/stderr 使用 UTF-8。
+
+    Windows 控制台（含 GitHub Actions）默认编码是 cp1252/gbk，
+    直接 print 中文会抛 UnicodeEncodeError 导致脚本中断。
+    errors="replace" 保证即使终端无法显示也不会崩溃。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8()
+
+
 ROOT = Path(__file__).resolve().parent
 ENTRY = ROOT / "src" / "pdf_ocr_desktop.py"
 NAME = "PDFOCR工具"

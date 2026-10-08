@@ -6,6 +6,7 @@ build/
 src/testdata/
 src/testdata_tools/
 stress_*/
+selftest_report.txt
 __pycache__/
 *.pyc
 .DS_Store
